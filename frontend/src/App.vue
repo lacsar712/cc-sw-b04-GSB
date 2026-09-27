@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from './api.js'
+import FilterPanel from './components/FilterPanel.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -9,6 +10,7 @@ const token = ref(localStorage.getItem('tok') || '')
 const role = ref(localStorage.getItem('role') || '')
 const user = ref(localStorage.getItem('user') || '')
 const err = ref('')
+const showFilter = ref(false)
 const loginForm = ref({ username: 'calibrator', password: 'calib123456' })
 
 const isHome = computed(() => route.path === '/')
@@ -40,6 +42,7 @@ function logout() {
   token.value = ''
   role.value = ''
   user.value = ''
+  showFilter.value = false
   localStorage.clear()
   router.push('/')
 }
@@ -57,12 +60,21 @@ function logout() {
           :class="{ active: isDetail }"
           title="请从总表点击任务行进入"
         >任务详情</span>
+        <span class="nav-sep">|</span>
+        <button
+          type="button"
+          class="nav-toggle"
+          :class="{ active: showFilter }"
+          @click="showFilter = !showFilter"
+        >过滤台</button>
       </nav>
       <div class="user-area">
         <span>{{ user }}（{{ role }}）</span>
         <button type="button" @click="logout">退出</button>
       </div>
     </header>
+
+    <FilterPanel v-if="token" :visible="showFilter" @close="showFilter = false" />
 
     <main class="main" :class="{ 'with-topbar': !!token }">
       <template v-if="!token">
@@ -131,6 +143,24 @@ function logout() {
 }
 .nav-sep {
   color: #5a6a7a;
+}
+.nav-toggle {
+  color: #a8b8c8;
+  background: none;
+  border: none;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.nav-toggle:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
+}
+.nav-toggle.active {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.15);
+  font-weight: 600;
 }
 .nav-hint {
   cursor: default;
