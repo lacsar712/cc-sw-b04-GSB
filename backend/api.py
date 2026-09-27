@@ -30,7 +30,32 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS filter_schemes (
+    id serial PRIMARY KEY,
+    name text NOT NULL,
+    prefix text NOT NULL DEFAULT '',
+    note text NOT NULL DEFAULT '',
+    created_by text NOT NULL,
+    updated_by text NOT NULL,
+    created_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL,
+    UNIQUE (name)
+);
+CREATE TABLE IF NOT EXISTS filter_history (
+    id serial PRIMARY KEY,
+    scheme_id integer,
+    scheme_name text NOT NULL,
+    action text NOT NULL,
+    prefix text NOT NULL DEFAULT '',
+    note text NOT NULL DEFAULT '',
+    actor text NOT NULL,
+    created_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_filter_history_sid ON filter_history(scheme_id);
 """
+
+# LIKE 中需要转义的特殊字符，避免用户前缀里的 % / _ / \ 被当通配符
+LIKE_ESCAPE = str.maketrans({"\\": "\\\\", "%": r"\%", "_": r"\_"})
 
 
 def connect():
@@ -46,6 +71,12 @@ class JobIn(BaseModel):
     lamp: str
     nominal_nm: float
     measured_nm: float
+
+
+class SchemeIn(BaseModel):
+    name: str
+    prefix: str = ""
+    note: str = ""
 
 
 def user_from_request(request: Request) -> dict:
@@ -84,12 +115,25 @@ async def login(data: LoginIn) -> dict:
 
 
 @get("/api/jobs")
-async def list_jobs(request: Request) -> list:
+async def list_jobs(request: Request, prefix: str = "") -> list:
     user_from_request(request)
+    prefix = (prefix or "").strip()
     with connect() as conn:
-        rows = conn.execute(
-            "SELECT id, lamp, nominal_nm, measured_nm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
-        ).fetchall()
+        if prefix:
+            like = prefix.translate(LIKE_ESCAPE) + "%"
+            rows = conn.execute(
+                """
+                SELECT id, lamp, nominal_nm, measured_nm, status, verdict, reason, created_by
+                FROM jobs
+                WHERE lamp LIKE %s ESCAPE '\\'
+                ORDER BY id DESC
+                """,
+                (like,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, lamp, nominal_nm, measured_nm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
+            ).fetchall()
         return list(rows)
 
 
@@ -123,6 +167,159 @@ async def create_job(request: Request, data: JobIn) -> dict:
         return {"id": row["id"], "status": "pending"}
 
 
+def log_history(conn, *, scheme_id, scheme_name, action, prefix, note, actor) -> None:
+    conn.execute(
+        """
+        INSERT INTO filter_history(scheme_id, scheme_name, action, prefix, note, actor, created_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (scheme_id, scheme_name, action, prefix, note, actor, datetime.now(timezone.utc)),
+    )
+
+
+def can_delete(user: dict, scheme: dict) -> bool:
+    # 方案创建者本人可删；校准员（可写角色）可删任意方案；巡检不可删他人方案
+    return scheme["created_by"] == user["username"] or user["role"] == "writer"
+
+
+def _jsonable(rows):
+    # 显式把 datetime 转为 ISO 字符串，保证返回可被 JSON 序列化
+    out = []
+    for row in rows:
+        item = {}
+        for k, v in dict(row).items():
+            item[k] = v.isoformat() if isinstance(v, datetime) else v
+        out.append(item)
+    return out
+
+
+@get("/api/filter-schemes")
+async def list_schemes(request: Request) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, name, prefix, note, created_by, updated_by, created_at, updated_at
+            FROM filter_schemes ORDER BY id DESC
+            """
+        ).fetchall()
+        return _jsonable(rows)
+
+
+@post("/api/filter-schemes")
+async def create_scheme(request: Request, data: SchemeIn) -> dict:
+    user = user_from_request(request)
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="方案名不能为空")
+    prefix = data.prefix.strip()
+    note = data.note.strip()
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM filter_schemes WHERE name=%s",
+            (name,),
+        ).fetchone()
+        if exists:
+            raise HTTPException(status_code=409, detail="同名方案已存在")
+        row = conn.execute(
+            """
+            INSERT INTO filter_schemes(name, prefix, note, created_by, updated_by, created_at, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id
+            """,
+            (name, prefix, note, user["username"], user["username"], now, now),
+        ).fetchone()
+        log_history(
+            conn,
+            scheme_id=row["id"],
+            scheme_name=name,
+            action="create",
+            prefix=prefix,
+            note=note,
+            actor=user["username"],
+        )
+        conn.commit()
+        return {"id": row["id"], "name": name, "prefix": prefix, "note": note}
+
+
+@post("/api/filter-schemes/{scheme_id:int}")
+async def update_scheme(request: Request, scheme_id: int, data: SchemeIn) -> dict:
+    user = user_from_request(request)
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="方案名不能为空")
+    prefix = data.prefix.strip()
+    note = data.note.strip()
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        scheme = conn.execute(
+            "SELECT id, name, created_by FROM filter_schemes WHERE id=%s", (scheme_id,)
+        ).fetchone()
+        if not scheme:
+            raise HTTPException(status_code=404, detail="方案不存在")
+        # 校准员与巡检均可保存变动（仅删除对巡检有归属限制）
+        dup = conn.execute(
+            "SELECT created_by FROM filter_schemes WHERE name=%s AND id<>%s",
+            (name, scheme_id),
+        ).fetchone()
+        if dup:
+            raise HTTPException(status_code=409, detail="同名方案已存在")
+        conn.execute(
+            "UPDATE filter_schemes SET name=%s, prefix=%s, note=%s, updated_by=%s, updated_at=%s WHERE id=%s",
+            (name, prefix, note, user["username"], now, scheme_id),
+        )
+        log_history(
+            conn,
+            scheme_id=scheme_id,
+            scheme_name=name,
+            action="update",
+            prefix=prefix,
+            note=note,
+            actor=user["username"],
+        )
+        conn.commit()
+        return {"id": scheme_id, "name": name, "prefix": prefix, "note": note}
+
+
+@post("/api/filter-schemes/{scheme_id:int}/delete")
+async def delete_scheme(request: Request, scheme_id: int) -> dict:
+    user = user_from_request(request)
+    with connect() as conn:
+        scheme = conn.execute(
+            "SELECT id, name, prefix, note, created_by FROM filter_schemes WHERE id=%s", (scheme_id,)
+        ).fetchone()
+        if not scheme:
+            raise HTTPException(status_code=404, detail="方案不存在")
+        if not can_delete(user, scheme):
+            raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="巡检不可删除他人方案")
+        conn.execute("DELETE FROM filter_schemes WHERE id=%s", (scheme_id,))
+        # 删除后仍在履历留痕
+        log_history(
+            conn,
+            scheme_id=scheme_id,
+            scheme_name=scheme["name"],
+            action="delete",
+            prefix=scheme["prefix"],
+            note=scheme["note"],
+            actor=user["username"],
+        )
+        conn.commit()
+        return {"deleted": scheme_id}
+
+
+@get("/api/filter-history")
+async def list_history(request: Request) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, scheme_id, scheme_name, action, prefix, note, actor, created_at
+            FROM filter_history ORDER BY id DESC
+            """
+        ).fetchall()
+        return _jsonable(rows)
+
+
 def on_startup() -> None:
     with connect() as conn:
         conn.execute(SCHEMA)
@@ -141,4 +338,18 @@ def on_startup() -> None:
         conn.commit()
 
 
-app = Litestar(route_handlers=[health, login, list_jobs, get_job, create_job], on_startup=[on_startup])
+app = Litestar(
+    route_handlers=[
+        health,
+        login,
+        list_jobs,
+        get_job,
+        create_job,
+        list_schemes,
+        create_scheme,
+        update_scheme,
+        delete_scheme,
+        list_history,
+    ],
+    on_startup=[on_startup],
+)
